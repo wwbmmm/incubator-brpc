@@ -92,6 +92,23 @@ TEST(RWLockTest, init_ignores_attr) {
     ASSERT_EQ(0, bthread_rwlock_destroy(&without_attr));
 }
 
+// A lock initialized with a non-null (ignored) attribute must work the
+// same under bthread workers as one initialized with nullptr: the readers
+// and the writer run their critical sections to completion and the lock
+// is destroyed cleanly afterwards.
+TEST(RWLockTest, attr_initialized_lock_works_in_bthread) {
+    bthread_rwlockattr_t attr;
+    bthread_rwlock_t rw;
+    ASSERT_EQ(0, bthread_rwlock_init(&rw, &attr));
+    bthread_t rdth;
+    bthread_t wrth;
+    ASSERT_EQ(0, bthread_start_urgent(&rdth, nullptr, rdlocker, &rw));
+    ASSERT_EQ(0, bthread_start_urgent(&wrth, nullptr, wrlocker, &rw));
+    ASSERT_EQ(0, bthread_join(rdth, nullptr));
+    ASSERT_EQ(0, bthread_join(wrth, nullptr));
+    ASSERT_EQ(0, bthread_rwlock_destroy(&rw));
+}
+
 TEST(RWLockTest, used_in_pthread) {
     bthread_rwlock_t rw;
     ASSERT_EQ(0, bthread_rwlock_init(&rw, nullptr));
