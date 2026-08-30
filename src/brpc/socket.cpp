@@ -2236,11 +2236,11 @@ int Socket::OnInputEvent(void* user_data, uint32_t events,
         return 0;
     }
     if (s->fd() < 0) {
-#if defined(OS_LINUX)
-        CHECK(!(events & EPOLLIN)) << "epoll_events=" << events;
-#elif defined(OS_MACOSX)
-        CHECK((short)events != EVFILT_READ) << "kqueue filter=" << events;
-#endif
+        // `events' can be a stale read event which was already fetched by
+        // epoll_wait/kevent before the previous fd was closed by health
+        // checking (`WaitAndReset') and got processed after the Socket was
+        // `Revive'-d, when the Socket is addressable again while the new
+        // fd has not been created yet. Just ignore the event.
         return -1;
     }
 

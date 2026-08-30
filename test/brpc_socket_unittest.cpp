@@ -43,7 +43,9 @@
 #include "brpc/channel.h"
 #include "brpc/controller.h"
 #include "health_check.pb.h"
-#if defined(OS_MACOSX)
+#if defined(OS_LINUX)
+#include <sys/epoll.h>
+#elif defined(OS_MACOSX)
 #include <sys/event.h>
 #endif
 #include <netinet/tcp.h>
@@ -56,6 +58,7 @@ extern TaskControl* g_task_control;
 
 namespace brpc {
 DECLARE_int32(health_check_interval);
+DECLARE_int32(circuit_breaker_min_isolation_duration_ms);
 DECLARE_bool(socket_keepalive);
 DECLARE_int32(socket_keepalive_idle_s);
 DECLARE_int32(socket_keepalive_interval_s);
@@ -816,6 +819,113 @@ TEST_F(SocketTest, health_check) {
     // The id is invalid.
     brpc::SocketUniquePtr ptr;
     ASSERT_EQ(-1, brpc::Socket::Address(id, &ptr));
+}
+
+static void EmptyOnEdgeTriggeredEvents(brpc::Socket*) {}
+
+TEST_F(SocketTest, ignore_stale_input_event_after_revive) {
+    // Emulate the race in https://github.com/apache/brpc/issues/3492:
+    // a read event that was already fetched by epoll_wait/kevent may be
+    // processed by Socket::OnInputEvent after the failed Socket was
+    // `Revive'-d by health checking, when the Socket is addressable again
+    // while its fd is still -1 (the previous fd was closed by
+    // `WaitAndReset' and the new fd has not been created yet). OnInputEvent
+    // should ignore the stale event instead of CHECK-failing on it.
+
+    // The peer fd is kept open during the test so that no real epoll event
+    // is ever produced; the stale read event is emulated by calling
+    // Socket::OnInputEvent directly with the events fetched before the
+    // previous fd was closed.
+    int fds[2];
+    ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
+
+    brpc::SocketId id = 8888;
+    butil::EndPoint point(butil::IP_ANY, 7585/*not listened*/);
+    brpc::SocketOptions options;
+    options.fd = fds[0];
+    options.remote_side = point;
+    options.user = new CheckRecycle;
+    options.on_edge_triggered_events = EmptyOnEdgeTriggeredEvents;
+    options.health_check_interval_s = 1/*s*/;
+    ASSERT_EQ(0, brpc::Socket::Create(options, &id));
+
+    // Postpone the health checking tasks scheduled by the SetFailed()
+    // below so that they never interfere with this test.
+    char old_min_isolation_duration_ms[16];
+    snprintf(old_min_isolation_duration_ms,
+             sizeof(old_min_isolation_duration_ms), "%d",
+             brpc::FLAGS_circuit_breaker_min_isolation_duration_ms);
+    GFLAGS_NAMESPACE::SetCommandLineOption(
+        "circuit_breaker_min_isolation_duration_ms", "600000");
+
+    // The Socket holds the additional reference added in Create() and the
+    // health-checking-related reference.
+    int32_t nref = -1;
+    ASSERT_EQ(0, brpc::Socket::Status(id, &nref));
+    ASSERT_EQ(2, nref);
+
+    {
+        brpc::SocketUniquePtr s;
+        ASSERT_EQ(0, brpc::Socket::Address(id, &s));
+        global_sock = s.get();
+        ASSERT_EQ(fds[0], s->fd());
+        // The Socket is SetFailed by someone else (e.g. an RPC failed).
+        ASSERT_EQ(0, s->SetFailed());
+    }
+
+    // Emulate what HealthCheckTask::OnTriggeringTask does: wait for other
+    // references to be released, close the previous fd, then `Revive' the
+    // Socket after the health check succeeds. The Socket becomes
+    // addressable again while its fd is still -1.
+    {
+        brpc::SocketUniquePtr hc_ptr;
+        ASSERT_EQ(1, brpc::Socket::AddressFailedAsWell(id, &hc_ptr));
+        ASSERT_EQ(0, hc_ptr->WaitAndReset(2/*note*/));
+        ASSERT_EQ(-1, hc_ptr->fd());
+        hc_ptr->Revive(2/*note*/);
+        ASSERT_FALSE(hc_ptr->Failed());
+        ASSERT_EQ(-1, hc_ptr->fd());
+    }
+
+    // The EventDispatcher processes the stale read event which was
+    // fetched before the previous fd was closed. Turn on
+    // crash_on_fatal_log so that the CHECK (if any) inside OnInputEvent
+    // crashes the test.
+    std::string old_crash_on_fatal_log;
+    GFLAGS_NAMESPACE::GetCommandLineOption("crash_on_fatal_log",
+                                           &old_crash_on_fatal_log);
+    GFLAGS_NAMESPACE::SetCommandLineOption("crash_on_fatal_log", "true");
+#if defined(OS_LINUX)
+    const uint32_t stale_events = EPOLLIN | EPOLLRDHUP;
+#elif defined(OS_MACOSX)
+    const uint32_t stale_events = (uint32_t)(short)EVFILT_READ;
+#endif
+    ASSERT_EQ(-1, brpc::Socket::OnInputEvent((void*)id, stale_events,
+                                             BTHREAD_ATTR_NORMAL));
+    GFLAGS_NAMESPACE::SetCommandLineOption(
+        "crash_on_fatal_log", old_crash_on_fatal_log.c_str());
+
+    // Fail the Socket again (so that the health checking tasks scheduled
+    // by the SetFailed() above see a non-alive Socket and exit normally)
+    // and recycle it.
+    ASSERT_EQ(0, brpc::Socket::SetFailed(id));
+    {
+        brpc::SocketUniquePtr s;
+        ASSERT_EQ(1, brpc::Socket::AddressFailedAsWell(id, &s));
+        s->ReleaseHCRelatedReference();
+    }
+    int64_t start_time = butil::cpuwide_time_us();
+    while (global_sock != nullptr) {
+        bthread_usleep(1000);
+        ASSERT_LT(butil::cpuwide_time_us(), start_time + 1000000L);
+    }
+    brpc::SocketUniquePtr ptr;
+    ASSERT_EQ(-1, brpc::Socket::Address(id, &ptr));
+    close(fds[1]);
+
+    GFLAGS_NAMESPACE::SetCommandLineOption(
+        "circuit_breaker_min_isolation_duration_ms",
+        old_min_isolation_duration_ms);
 }
 
 void* Writer(void* void_arg) {
