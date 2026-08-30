@@ -2145,6 +2145,103 @@ TEST_F(RdmaTest, channel_option_invalid) {
     ASSERT_EQ(-1, channel.Init(g_ep, &chan_options));
 }
 
+TEST_F(RdmaTest, poll_cq_discard_stale_cq_callback) {
+    StartServer();
+
+    // Any socket whose transport owns an RdmaEndpoint is enough to emulate
+    // the stale CQ callback: what matters is that the main socket is still
+    // addressable (as a revived socket would be) while the endpoint has
+    // switched its CQ generation. Note that in UT (g_skip_rdma_init) no real
+    // RDMA resource is allocated and _resource stays null, so reaching the
+    // polling part of RdmaEndpoint::PollCq with a stale CQ socket crashes.
+    sockaddr_in addr;
+    bzero((char*)&addr, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(PORT);
+
+    butil::fd_guard sockfd(socket(AF_INET, SOCK_STREAM, 0));
+    ASSERT_TRUE(sockfd >= 0);
+    ASSERT_EQ(0, connect(sockfd, (sockaddr*)&addr, sizeof(sockaddr)));
+    usleep(100000);  // wait for server to handle the msg
+    Socket* raw = GetSocketFromServer(0);
+    ASSERT_TRUE(raw != nullptr);
+    SocketUniquePtr s;
+    ASSERT_EQ(0, Socket::Address(raw->id(), &s));
+    ASSERT_FALSE(s->Failed());
+    auto* ep = static_cast<RdmaTransport*>(s->_transport.get())->_rdma_ep;
+    ASSERT_TRUE(ep != nullptr);
+
+    // Create two CQ sockets like DoAllocateResources() does (polling-mode
+    // flavor which requires no fd): `stale_sid' emulates the CQ of the old
+    // generation whose callback is still queued after the endpoint was
+    // reset, `current_sid' emulates the CQ created by the handshake running
+    // on the revived socket.
+    SocketOptions options;
+    options.user = ep;
+    options.keytable_pool = s->_keytable_pool;
+    SocketId stale_sid = INVALID_SOCKET_ID;
+    SocketId current_sid = INVALID_SOCKET_ID;
+    ASSERT_EQ(0, Socket::Create(options, &stale_sid));
+    ASSERT_EQ(0, Socket::Create(options, &current_sid));
+    ASSERT_NE(stale_sid, current_sid);
+    {
+        SocketUniquePtr m;
+        ASSERT_EQ(0, Socket::Address(stale_sid, &m));
+        ASSERT_EQ(ep, m->user());
+    }
+
+    // Case 1: the endpoint was reset by RdmaTransport::Reset() (which calls
+    // DeallocateResources() and clears _cq_sid) while the main socket was
+    // later revived. The stale callback queued on the old CQ must be
+    // discarded instead of touching the (already released) RDMA resources.
+    ep->_cq_sid = INVALID_SOCKET_ID;
+    {
+        SocketUniquePtr m;
+        ASSERT_EQ(0, Socket::Address(stale_sid, &m));
+        rdma::RdmaEndpoint::PollCq(m.get());
+        ASSERT_FALSE(s->Failed());
+        ASSERT_EQ(INVALID_SOCKET_ID, ep->_cq_sid);
+    }
+
+    // Case 2: the revived socket completed a new handshake and the endpoint
+    // switched to the new CQ. The stale callback (running with the old CQ
+    // socket acquired before the reset) must be discarded as well,
+    // otherwise it would operate on the new generation's RDMA resources in
+    // RdmaEndpoint::PollCq and crash.
+    ep->_cq_sid = current_sid;
+    {
+        SocketUniquePtr m;
+        ASSERT_EQ(0, Socket::Address(stale_sid, &m));
+        rdma::RdmaEndpoint::PollCq(m.get());
+        ASSERT_FALSE(s->Failed());
+        ASSERT_EQ(current_sid, ep->_cq_sid);
+    }
+
+    // Release the emulated CQ sockets in the same way as
+    // DeallocateResources() does so that they don't outlive the endpoint.
+    for (SocketId sid : { stale_sid, current_sid }) {
+        SocketUniquePtr m;
+        if (Socket::Address(sid, &m) == 0) {
+            m->_user = nullptr;  // Do not release user (the RdmaEndpoint).
+            m->_fd = -1;  // No fd is attached to the emulated CQ sockets.
+            m->SetFailed();
+        }
+    }
+    ep->_cq_sid = INVALID_SOCKET_ID;
+
+    // Release the reference to the main socket before closing the connection
+    // and stopping the server: Acceptor::Join() waits for the server-side
+    // socket to be recycled, which never happens while we still hold a
+    // reference to it.
+    s.reset();
+
+    sockfd.reset(-1);
+    usleep(100000);  // wait for server to handle the msg
+    ASSERT_EQ(nullptr, GetSocketFromServer(0));
+
+    StopServer();
+}
+
 TEST_P(RdmaRpcTest, rdma_client_to_rdma_server) {
     if (!FLAGS_rdma_test_enable) {
         return;
