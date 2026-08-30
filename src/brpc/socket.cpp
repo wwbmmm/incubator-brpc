@@ -2236,11 +2236,16 @@ int Socket::OnInputEvent(void* user_data, uint32_t events,
         return 0;
     }
     if (s->fd() < 0) {
-#if defined(OS_LINUX)
-        CHECK(!(events & EPOLLIN)) << "epoll_events=" << events;
-#elif defined(OS_MACOSX)
-        CHECK((short)events != EVFILT_READ) << "kqueue filter=" << events;
-#endif
+        // The event is stale and belongs to an already-closed fd, just
+        // discard it. One racing case is that the Socket was SetFailed and
+        // its fd was closed and reset to -1 by the health checking (inside
+        // `WaitAndReset'), then the Socket was revived (the fd is still -1)
+        // before the EventDispatcher processed the event which had been
+        // fetched from epoll/kqueue before the fd was closed. Address()
+        // above succeeds because the Socket has been revived, but the fd
+        // is not readable or even valid anymore.
+        RPC_VLOG << "Discard stale input event=" << events
+                 << " on SocketId=" << id;
         return -1;
     }
 

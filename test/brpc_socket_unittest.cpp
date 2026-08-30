@@ -818,6 +818,103 @@ TEST_F(SocketTest, health_check) {
     ASSERT_EQ(-1, brpc::Socket::Address(id, &ptr));
 }
 
+TEST_F(SocketTest, discard_stale_input_event_of_revived_socket) {
+    // Reproduces https://github.com/apache/brpc/issues/3492.
+    //
+    // The racing sequence:
+    // 1. The Socket fails with SetFailed() and becomes unaddressable.
+    // 2. The health checking task calls WaitAndReset() which closes the
+    //    fd and resets it to -1.
+    // 3. The health checking succeeds and Revive()s the Socket, making it
+    //    addressable again while the fd is still -1.
+    // 4. The EventDispatcher processes an input event which was fetched
+    //    from epoll/kqueue *before* the fd was closed (e.g. the dispatcher
+    //    bthread was descheduled). Socket::Address() in OnInputEvent()
+    //    succeeds because the Socket has been revived, but fd() is -1.
+    //    The stale event belongs to the closed fd and must be discarded
+    //    silently instead of CHECK-failing (which crashed the process).
+    int fds[2];
+    ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
+
+    int listening_fd = -1;
+    butil::EndPoint point(butil::IP_ANY, 7979);
+    for (int i = 0; i < 100; ++i) {
+        point.port += i;
+        listening_fd = tcp_listen(point);
+        if (listening_fd >= 0) {
+            break;
+        }
+    }
+    ASSERT_GT(listening_fd, 0) << berror();
+
+    brpc::SocketId id = 8888;
+    brpc::SocketOptions options;
+    options.fd = fds[1];
+    options.remote_side = point;
+    options.user = new CheckRecycle;
+    options.health_check_interval_s = 1/*s*/;
+    options.need_on_edge_trigger = true;
+    ASSERT_EQ(0, brpc::Socket::Create(options, &id));
+    brpc::Socket* s = nullptr;
+    {
+        brpc::SocketUniquePtr ptr;
+        ASSERT_EQ(0, brpc::Socket::Address(id, &ptr));
+        s = ptr.get();
+    }
+    global_sock = s;
+    ASSERT_NE(nullptr, s);
+    ASSERT_EQ(fds[1], s->fd());
+
+    // The Socket fails, but its fd is not closed until the health checking
+    // calls WaitAndReset().
+    ASSERT_EQ(0, s->SetFailed());
+    ASSERT_EQ(1, brpc::Socket::Status(id));
+    ASSERT_EQ(fds[1], s->fd());
+
+    // The fd of listening side makes the health checking succeed and
+    // revive the Socket. Do not hold any reference to the Socket while
+    // waiting, otherwise WaitAndReset() inside the health checking waits
+    // for the reference forever.
+    int64_t start_time = butil::cpuwide_time_us();
+    while (brpc::Socket::Status(id) != 0) {
+        bthread_usleep(1000);
+        ASSERT_LT(butil::cpuwide_time_us(), start_time + 2000000L) << "Too long!";
+    }
+    ASSERT_TRUE(global_sock);
+    // The Socket was revived, but the fd had been closed and reset to -1
+    // by WaitAndReset() inside the health checking.
+    ASSERT_EQ(-1, s->fd());
+    ASSERT_EQ(-1, fcntl(fds[1], F_GETFD));
+    ASSERT_EQ(EBADF, errno);
+
+    // Deliver the stale input event which was fetched from epoll/kqueue
+    // before the fd was closed, just like what the EventDispatcher does.
+    // On Linux, the event of the peer-closed fd is EPOLLIN|EPOLLRDHUP;
+    // on macOS, input events are delivered with the EVFILT_READ filter.
+    // OnInputEvent() must discard it instead of CHECK-failing.
+#if defined(OS_LINUX)
+    const uint32_t stale_events = EPOLLIN | EPOLLRDHUP;
+#elif defined(OS_MACOSX)
+    const uint32_t stale_events = (uint32_t)(int16_t)EVFILT_READ;
+#endif
+    ASSERT_EQ(-1, brpc::Socket::OnInputEvent(
+                      (void*)id, stale_events, BTHREAD_ATTR_NORMAL));
+    // The Socket is still alive after discarding the stale event.
+    ASSERT_EQ(0, brpc::Socket::Status(id));
+
+    // Release resources.
+    s->ReleaseHCRelatedReference();
+    close(fds[0]);
+    close(listening_fd);
+    ASSERT_EQ(0, brpc::Socket::SetFailed(id));
+    start_time = butil::cpuwide_time_us();
+    while (global_sock != nullptr) {
+        bthread_usleep(1000);
+        ASSERT_LT(butil::cpuwide_time_us(), start_time + 1000000L) << "Too long!";
+    }
+    ASSERT_EQ(-1, brpc::Socket::Status(id));
+}
+
 void* Writer(void* void_arg) {
     WriterArg* arg = static_cast<WriterArg*>(void_arg);
     brpc::SocketUniquePtr sock;
