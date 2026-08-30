@@ -70,6 +70,7 @@ extern ibv_qp* (*IbvCreateQp)(ibv_pd*, ibv_qp_init_attr*);
 extern int (*IbvModifyQp)(ibv_qp*, ibv_qp_attr*, ibv_qp_attr_mask);
 extern int (*IbvQueryQp)(ibv_qp*, ibv_qp_attr*, ibv_qp_attr_mask, ibv_qp_init_attr*);
 extern int (*IbvDestroyQp)(ibv_qp*);
+extern int (*IbvGetCqEvent)(ibv_comp_channel*, ibv_cq**, void**);
 extern butil::atomic<bool> g_rdma_available;
 extern bool g_skip_rdma_init;
 extern bool g_fail_resource_alloc_for_test;
@@ -2024,6 +2025,104 @@ TEST_F(RdmaTest, server_alloc_resource_fail_fallback_tcp) {
     ASSERT_EQ(nullptr, GetSocketFromServer(0));
 
     StopServer();
+}
+
+// Counter observing whether the mocked verbs layer was entered.
+static int g_mock_get_cq_event_calls = 0;
+
+// Mock of ibv_get_cq_event used by the stale-callback test below: report
+// an empty completion channel, just like a real drained one.
+static int MockIbvGetCqEvent(ibv_comp_channel*, ibv_cq** cq, void** ctx) {
+    (void)cq;
+    (void)ctx;
+    ++g_mock_get_cq_event_calls;
+    errno = EAGAIN;
+    return -1;
+}
+
+// RAII guard installing/removing MockIbvGetCqEvent.
+class MockIbvGetCqEventGuard {
+public:
+    MockIbvGetCqEventGuard() : _saved(rdma::IbvGetCqEvent) {
+        rdma::IbvGetCqEvent = MockIbvGetCqEvent;
+    }
+    ~MockIbvGetCqEventGuard() {
+        rdma::IbvGetCqEvent = _saved;
+    }
+private:
+    int (*_saved)(ibv_comp_channel*, ibv_cq**, void**);
+};
+
+// A CQ callback may remain queued after its endpoint is reset (the CQ
+// socket is detached and failed by DeallocateResources). If the main
+// socket is revived and reconnects with a new CQ, the stale callback is
+// still able to acquire the revived main socket and used to continue
+// operating on the endpoint's new generation of RDMA resources, causing
+// invalid or mismatched accesses in PollCq (e.g. a crash). PollCq must
+// reject callbacks whose CQ socket no longer matches the endpoint's
+// current _cq_sid.
+TEST_F(RdmaTest, reject_stale_cq_callback_after_switching_to_new_cq) {
+    // The main RDMA socket owning the endpoint. It stays addressable,
+    // standing for the revived main socket in the scenario above (PollCq
+    // acquires it via Socket::Address(_socket->id())).
+    SocketOptions main_options;
+    main_options.socket_mode = SOCKET_MODE_RDMA;
+    SocketId main_sid;
+    ASSERT_EQ(0, Socket::Create(main_options, &main_sid));
+    SocketUniquePtr main_socket;
+    ASSERT_EQ(0, Socket::Address(main_sid, &main_socket));
+    auto* transport = static_cast<RdmaTransport*>(main_socket->_transport.get());
+    rdma::RdmaEndpoint* ep = transport->_rdma_ep;
+    ASSERT_TRUE(ep != nullptr);
+
+    // CQ socket options, mirroring RdmaEndpoint::AllocateResources (an fd is
+    // not needed: the polling-mode allocation creates the CQ socket without
+    // one as well).
+    SocketOptions cq_options;
+    cq_options.user = ep;
+    cq_options.keytable_pool = main_socket->_keytable_pool;
+    cq_options.on_edge_triggered_events = rdma::RdmaEndpoint::PollCq;
+
+    // The first CQ generation. The endpoint is reset afterwards, but a
+    // callback that already read m->user() before DeallocateResources()
+    // detached the old CQ socket may still be on the fly, so the stale
+    // CQ socket still points to the endpoint here.
+    SocketId stale_sid;
+    ASSERT_EQ(0, Socket::Create(cq_options, &stale_sid));
+    SocketUniquePtr stale_cq_socket;
+    ASSERT_EQ(0, Socket::Address(stale_sid, &stale_cq_socket));
+
+    // The endpoint is re-allocated with a second CQ generation: a fresh
+    // resource and a fresh CQ socket.
+    ep->_resource = new rdma::RdmaResource;
+    SocketId current_sid;
+    ASSERT_EQ(0, Socket::Create(cq_options, &current_sid));
+    SocketUniquePtr current_cq_socket;
+    ASSERT_EQ(0, Socket::Address(current_sid, &current_cq_socket));
+    ep->_cq_sid = current_sid;
+    ASSERT_NE(stale_sid, current_sid);
+
+    // Run the stale callback. Before the fix it went past the revived main
+    // socket and started to operate on the new-generation resources (which
+    // may even crash); with the fix it must be rejected before touching
+    // anything of the endpoint.
+    g_mock_get_cq_event_calls = 0;
+    {
+        MockIbvGetCqEventGuard guard;
+        rdma::RdmaEndpoint::PollCq(stale_cq_socket.get());
+    }
+    ASSERT_EQ(0, g_mock_get_cq_event_calls);
+    ASSERT_FALSE(main_socket->Failed());
+
+    // Restore the endpoint so that recycling the main socket (which deletes
+    // the endpoint) does not touch the fake resource or the CQ sockets.
+    delete ep->_resource;
+    ep->_resource = nullptr;
+    ep->_cq_sid = INVALID_SOCKET_ID;
+    stale_cq_socket->_user = nullptr;
+    stale_cq_socket->SetFailed();
+    current_cq_socket->_user = nullptr;
+    current_cq_socket->SetFailed();
 }
 
 TEST_F(RdmaTest, try_global_disable_rdma) {

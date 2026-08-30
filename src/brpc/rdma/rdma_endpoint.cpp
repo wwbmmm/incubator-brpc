@@ -1472,6 +1472,21 @@ void RdmaEndpoint::PollCq(Socket* m) {
         return;
     }
 
+    // The callback may remain queued after the endpoint was reset (the CQ
+    // socket was detached and failed). If the main socket is revived and
+    // reconnects with a new CQ, such a stale callback is still able to
+    // acquire the revived main socket and would go on operating on the
+    // endpoint's new generation of RDMA resources, which are unrelated to
+    // the CQ that the callback was queued for, causing invalid or
+    // mismatched accesses in PollCq. Reject callbacks which do not belong
+    // to the endpoint's current CQ.
+    if (m->id() != ep->_cq_sid) {
+        LOG_IF(WARNING, FLAGS_rdma_trace_verbose)
+            << "Reject stale cq callback of " << m->description()
+            << " because endpoint's current cq_sid doesn't match";
+        return;
+    }
+
     SocketUniquePtr s;
     if (Socket::Address(ep->_socket->id(), &s) < 0) {
         return;
