@@ -247,15 +247,15 @@ typedef struct bthread_rwlock_t {
     unsigned* lock_word;
 } bthread_rwlock_t;
 
+// Attribute type of bthread_rwlock_init(). Kept because it appears in the
+// signature of the implemented bthread_rwlock_init(), which currently
+// ignores it: no read-write lock attribute API is implemented.
 typedef struct {
 } bthread_rwlockattr_t;
 
-typedef struct {
-    unsigned int count;
-} bthread_barrier_t;
-
-typedef struct {
-} bthread_barrierattr_t;
+// NOTE: bthread_barrier_t / bthread_barrierattr_t were once declared here
+// for the never-implemented bthread_barrier_* functions and have been
+// removed.
 
 #if defined(__cplusplus)
 class bthread_once_t;

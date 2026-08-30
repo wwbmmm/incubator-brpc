@@ -29,6 +29,25 @@
 #include "bthread/task_meta.h"
 #include "bvar/bvar.h"
 
+// Negative compile-time guards for removed APIs.
+// bthread.h used to declare POSIX-style barrier APIs
+// (bthread_barrier_init/destroy/wait and their types) and read-write lock
+// attribute APIs (bthread_rwlockattr_init/destroy/getkind_np/setkind_np),
+// none of which was ever defined in libbrpc. User code compiled against
+// the header but then failed to link with "undefined reference". The
+// declarations below intentionally conflict with the removed ones, so this
+// file fails to compile if any of them is re-added without being
+// implemented.
+typedef int bthread_barrier_t;
+typedef int bthread_barrierattr_t;
+int bthread_barrier_init;
+int bthread_barrier_destroy;
+int bthread_barrier_wait;
+int bthread_rwlockattr_init;
+int bthread_rwlockattr_destroy;
+int bthread_rwlockattr_getkind_np;
+int bthread_rwlockattr_setkind_np;
+
 int main(int argc, char* argv[]) {
     testing::InitGoogleTest(&argc, argv);
     GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
@@ -57,6 +76,18 @@ protected:
     virtual void TearDown() {
     };
 };
+
+TEST_F(BthreadTest, rwlockattr_t_is_still_the_param_type_of_rwlock_init) {
+    // bthread_rwlockattr_t must stay declared: it is the attribute type in
+    // the signature of the implemented bthread_rwlock_init(), which ignores
+    // it (see bthread_rwlock_unittest.cpp for the behavioral check).
+    bthread_rwlockattr_t attr;
+    bthread_rwlock_t rwlock;
+    ASSERT_EQ(0, bthread_rwlock_init(&rwlock, &attr));
+    ASSERT_EQ(0, bthread_rwlock_rdlock(&rwlock));
+    ASSERT_EQ(0, bthread_rwlock_unlock(&rwlock));
+    ASSERT_EQ(0, bthread_rwlock_destroy(&rwlock));
+}
 
 TEST_F(BthreadTest, sizeof_task_meta) {
     LOG(INFO) << "sizeof(TaskMeta)=" << sizeof(bthread::TaskMeta);

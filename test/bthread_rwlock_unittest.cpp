@@ -67,6 +67,48 @@ TEST(RWLockTest, sanity) {
     ASSERT_EQ(0, bthread_rwlock_destroy(&rw));
 }
 
+TEST(RWLockTest, init_ignores_attr) {
+    // bthread_rwlockattr_t remains the declared attribute type of
+    // bthread_rwlock_init(), but no read-write lock attribute API is
+    // implemented and the attribute is ignored: initializing with a
+    // default-constructed attribute must behave exactly like initializing
+    // with nullptr.
+    bthread_rwlockattr_t attr;
+    bthread_rwlock_t with_attr;
+    bthread_rwlock_t without_attr;
+    ASSERT_EQ(0, bthread_rwlock_init(&with_attr, &attr));
+    ASSERT_EQ(0, bthread_rwlock_init(&without_attr, nullptr));
+
+    ASSERT_EQ(0, bthread_rwlock_rdlock(&with_attr));
+    ASSERT_EQ(0, bthread_rwlock_rdlock(&without_attr));
+    ASSERT_EQ(0, bthread_rwlock_unlock(&with_attr));
+    ASSERT_EQ(0, bthread_rwlock_unlock(&without_attr));
+    ASSERT_EQ(0, bthread_rwlock_trywrlock(&with_attr));
+    ASSERT_EQ(0, bthread_rwlock_trywrlock(&without_attr));
+    ASSERT_EQ(0, bthread_rwlock_unlock(&with_attr));
+    ASSERT_EQ(0, bthread_rwlock_unlock(&without_attr));
+
+    ASSERT_EQ(0, bthread_rwlock_destroy(&with_attr));
+    ASSERT_EQ(0, bthread_rwlock_destroy(&without_attr));
+}
+
+// A lock initialized with a non-null (ignored) attribute must work the
+// same under bthread workers as one initialized with nullptr: the readers
+// and the writer run their critical sections to completion and the lock
+// is destroyed cleanly afterwards.
+TEST(RWLockTest, attr_initialized_lock_works_in_bthread) {
+    bthread_rwlockattr_t attr;
+    bthread_rwlock_t rw;
+    ASSERT_EQ(0, bthread_rwlock_init(&rw, &attr));
+    bthread_t rdth;
+    bthread_t wrth;
+    ASSERT_EQ(0, bthread_start_urgent(&rdth, nullptr, rdlocker, &rw));
+    ASSERT_EQ(0, bthread_start_urgent(&wrth, nullptr, wrlocker, &rw));
+    ASSERT_EQ(0, bthread_join(rdth, nullptr));
+    ASSERT_EQ(0, bthread_join(wrth, nullptr));
+    ASSERT_EQ(0, bthread_rwlock_destroy(&rw));
+}
+
 TEST(RWLockTest, used_in_pthread) {
     bthread_rwlock_t rw;
     ASSERT_EQ(0, bthread_rwlock_init(&rw, nullptr));
