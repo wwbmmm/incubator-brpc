@@ -18,6 +18,7 @@
 #include <execinfo.h>
 #include <gtest/gtest.h>
 #include <memory>
+#include <type_traits>
 #include "butil/time.h"
 #include "butil/macros.h"
 #include "butil/logging.h"
@@ -35,6 +36,16 @@ int main(int argc, char* argv[]) {
     int rc = RUN_ALL_TESTS();
     return rc;
 }
+
+// Probe argument for the API-surface pins at the bottom of this file. It
+// must live in the GLOBAL namespace so that argument-dependent lookup in
+// those probes searches the global namespace, where the removed bthread_*
+// declarations used to live. The templated conversion operator makes the
+// probe viable for any pointer parameter, including the removed
+// bthread_barrier_t*.
+struct BthreadApiProbeArg {
+    template <typename T> operator T&() const; // never defined nor called
+};
 
 namespace bthread {
 #ifdef BRPC_BTHREAD_TRACER
@@ -739,6 +750,124 @@ TEST_F(BthreadTest, describe_exposed_yields_in_bthread_no_deadlock) {
         ASSERT_EQ(0, bthread_join(tids[i], nullptr));
     }
     // Reaching here (instead of hanging) means there was no deadlock.
+}
+
+// ----------------------------------------------------------------------
+// Pins for the public API surface of bthread.h.
+//
+// bthread_barrier_init/destroy/wait and bthread_rwlockattr_init/destroy/
+// getkind_np/setkind_np used to be declared in bthread.h but were never
+// defined in libbrpc, so any caller failed at link time with an undefined
+// reference. Their declarations, together with the bthread_barrier_t and
+// bthread_barrierattr_t types, have been removed. The probes below make
+// the build fail if one of these declarations ever comes back, while the
+// signature pins guarantee that the rwlock APIs kept in the header stay
+// source-compatible with previous releases.
+// ----------------------------------------------------------------------
+
+// The ellipsis fallbacks below are worse matches than any viable declared
+// function, so they are only chosen when no declaration of the probed name
+// is visible. Their return type is deliberately sized differently from the
+// `int' returned by the removed declarations, so a re-added declaration
+// winning overload resolution changes the sizeof() results below.
+typedef char api_gone_t[1];
+
+api_gone_t& bthread_barrier_init(...);
+api_gone_t& bthread_barrier_destroy(...);
+api_gone_t& bthread_barrier_wait(...);
+api_gone_t& bthread_rwlockattr_init(...);
+api_gone_t& bthread_rwlockattr_destroy(...);
+api_gone_t& bthread_rwlockattr_getkind_np(...);
+api_gone_t& bthread_rwlockattr_setkind_np(...);
+
+constexpr bool kBarrierDeclsGone =
+    sizeof(bthread_barrier_init(BthreadApiProbeArg(), nullptr, 0u)) == sizeof(api_gone_t) &&
+    sizeof(bthread_barrier_destroy(BthreadApiProbeArg())) == sizeof(api_gone_t) &&
+    sizeof(bthread_barrier_wait(BthreadApiProbeArg())) == sizeof(api_gone_t);
+static_assert(kBarrierDeclsGone,
+              "bthread_barrier_init/destroy/wait must stay undeclared:"
+              " they were never implemented in libbrpc and calling them"
+              " always failed at link time");
+
+constexpr bool kRwlockattrDeclsGone =
+    sizeof(bthread_rwlockattr_init((bthread_rwlockattr_t*)nullptr)) == sizeof(api_gone_t) &&
+    sizeof(bthread_rwlockattr_destroy((bthread_rwlockattr_t*)nullptr)) == sizeof(api_gone_t) &&
+    sizeof(bthread_rwlockattr_getkind_np((const bthread_rwlockattr_t*)nullptr,
+                                          (int*)nullptr)) == sizeof(api_gone_t) &&
+    sizeof(bthread_rwlockattr_setkind_np((bthread_rwlockattr_t*)nullptr, 0)) == sizeof(api_gone_t);
+static_assert(kRwlockattrDeclsGone,
+              "bthread_rwlockattr_init/destroy/getkind_np/setkind_np must stay"
+              " undeclared: they were never implemented in libbrpc and calling"
+              " them always failed at link time");
+
+// bthread_rwlockattr_t is kept (as an empty placeholder) so that the
+// signature of bthread_rwlock_init() is unchanged.
+static_assert(std::is_class<bthread_rwlockattr_t>::value &&
+              std::is_default_constructible<bthread_rwlockattr_t>::value,
+              "bthread_rwlockattr_t must stay a complete default-constructible"
+              " type: it is the `attr' parameter of bthread_rwlock_init()");
+
+// Pin the exact signatures of the rwlock APIs kept in bthread.h so that an
+// accidental signature change breaks the build instead of user code.
+static_assert(std::is_same<decltype(&bthread_rwlock_init),
+                           int (*)(bthread_rwlock_t*, const bthread_rwlockattr_t*)>::value,
+              "signature of bthread_rwlock_init() must stay unchanged");
+static_assert(std::is_same<decltype(&bthread_rwlock_destroy),
+                           int (*)(bthread_rwlock_t*)>::value,
+              "signature of bthread_rwlock_destroy() must stay unchanged");
+static_assert(std::is_same<decltype(&bthread_rwlock_rdlock),
+                           int (*)(bthread_rwlock_t*)>::value,
+              "signature of bthread_rwlock_rdlock() must stay unchanged");
+static_assert(std::is_same<decltype(&bthread_rwlock_tryrdlock),
+                           int (*)(bthread_rwlock_t*)>::value,
+              "signature of bthread_rwlock_tryrdlock() must stay unchanged");
+static_assert(std::is_same<decltype(&bthread_rwlock_timedrdlock),
+                           int (*)(bthread_rwlock_t*, const struct timespec*)>::value,
+              "signature of bthread_rwlock_timedrdlock() must stay unchanged");
+static_assert(std::is_same<decltype(&bthread_rwlock_wrlock),
+                           int (*)(bthread_rwlock_t*)>::value,
+              "signature of bthread_rwlock_wrlock() must stay unchanged");
+static_assert(std::is_same<decltype(&bthread_rwlock_trywrlock),
+                           int (*)(bthread_rwlock_t*)>::value,
+              "signature of bthread_rwlock_trywrlock() must stay unchanged");
+static_assert(std::is_same<decltype(&bthread_rwlock_timedwrlock),
+                           int (*)(bthread_rwlock_t*, const struct timespec*)>::value,
+              "signature of bthread_rwlock_timedwrlock() must stay unchanged");
+static_assert(std::is_same<decltype(&bthread_rwlock_unlock),
+                           int (*)(bthread_rwlock_t*)>::value,
+              "signature of bthread_rwlock_unlock() must stay unchanged");
+
+TEST_F(BthreadTest, dropped_barrier_and_rwlockattr_apis_are_not_declared) {
+    // The actual checks are the compile-time probes above; asserting the
+    // constants here keeps the coverage visible and filterable in test runs.
+    ASSERT_TRUE(kBarrierDeclsGone);
+    ASSERT_TRUE(kRwlockattrDeclsGone);
+}
+
+// Call the kept rwlock APIs through function pointers whose declared types
+// pin the public signatures, using both `attr' flavors of
+// bthread_rwlock_init() (a bthread_rwlockattr_t object and nullptr must
+// behave exactly the same since the attribute is ignored).
+TEST_F(BthreadTest, kept_rwlock_api_is_source_compatible) {
+    int (*init)(bthread_rwlock_t*, const bthread_rwlockattr_t*) = &bthread_rwlock_init;
+    int (*rdlock)(bthread_rwlock_t*) = &bthread_rwlock_rdlock;
+    int (*wrlock)(bthread_rwlock_t*) = &bthread_rwlock_wrlock;
+    int (*unlock)(bthread_rwlock_t*) = &bthread_rwlock_unlock;
+    int (*destroy)(bthread_rwlock_t*) = &bthread_rwlock_destroy;
+
+    bthread_rwlock_t rw;
+    bthread_rwlockattr_t attr;
+    ASSERT_EQ(0, init(&rw, &attr));
+    ASSERT_EQ(0, rdlock(&rw));
+    ASSERT_EQ(0, unlock(&rw));
+    ASSERT_EQ(0, wrlock(&rw));
+    ASSERT_EQ(0, unlock(&rw));
+    ASSERT_EQ(0, destroy(&rw));
+
+    ASSERT_EQ(0, init(&rw, nullptr));
+    ASSERT_EQ(0, rdlock(&rw));
+    ASSERT_EQ(0, unlock(&rw));
+    ASSERT_EQ(0, destroy(&rw));
 }
 
 } // namespace
