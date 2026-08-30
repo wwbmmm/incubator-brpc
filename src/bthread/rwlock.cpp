@@ -485,7 +485,9 @@ static int rwlock_destroy(bthread_rwlock_t* rwlock) {
 __BEGIN_DECLS
 
 int bthread_rwlock_init(bthread_rwlock_t* __restrict rwlock,
-                        const bthread_rwlockattr_t* __restrict) {
+                        const bthread_rwlockattr_t* __restrict attr) {
+    // `attr' is ignored: no rwlock attribute has been implemented yet.
+    (void)attr;
     return bthread::rwlock_init(rwlock);
 }
 

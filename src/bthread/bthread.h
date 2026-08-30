@@ -249,6 +249,8 @@ extern int bthread_cond_timedwait(
 
 // Initialize read-write lock `rwlock' using attributes `attr', or use
 // the default values if later is nullptr.
+// NOTE: `attr' is currently ignored and only kept for the POSIX-like
+// signature; passing nullptr behaves exactly the same.
 extern int bthread_rwlock_init(bthread_rwlock_t* __restrict rwlock,
                                const bthread_rwlockattr_t* __restrict attr);
 
@@ -278,23 +280,10 @@ extern int bthread_rwlock_timedwrlock(bthread_rwlock_t* __restrict rwlock,
 // Unlock `rwlock'.
 extern int bthread_rwlock_unlock(bthread_rwlock_t* rwlock);
 
-// ---------------------------------------------------
-// Functions for handling read-write lock attributes.
-// ---------------------------------------------------
-
-// Initialize attribute object `attr' with default values.
-extern int bthread_rwlockattr_init(bthread_rwlockattr_t* attr);
-
-// Destroy attribute object `attr'.
-extern int bthread_rwlockattr_destroy(bthread_rwlockattr_t* attr);
-
-// Return current setting of reader/writer preference.
-extern int bthread_rwlockattr_getkind_np(const bthread_rwlockattr_t* attr,
-                                         int* pref);
-
-// Set reader/write preference.
-extern int bthread_rwlockattr_setkind_np(bthread_rwlockattr_t* attr,
-                                         int pref);
+// NOTE: bthread_rwlockattr_init/destroy/getkind_np/setkind_np were never
+// implemented in libbrpc and their declarations have been removed. Only the
+// placeholder type bthread_rwlockattr_t (see types.h) is kept as the `attr'
+// parameter type of bthread_rwlock_init(), which ignores it.
 
 // -------------------------------------------
 // Functions for handling semaphore.
@@ -343,18 +332,9 @@ extern int bthread_sem_post(bthread_sem_t* sem);
 // Return 0 on success, errno otherwise.
 extern int bthread_sem_post_n(bthread_sem_t* sem, size_t n);
 
-
-// ----------------------------------------------------------------------
-// Functions for handling barrier which is a new feature in 1003.1j-2000.
-// ----------------------------------------------------------------------
-
-extern int bthread_barrier_init(bthread_barrier_t* __restrict barrier,
-                                const bthread_barrierattr_t* __restrict attr,
-                                unsigned count);
-
-extern int bthread_barrier_destroy(bthread_barrier_t* barrier);
-
-extern int bthread_barrier_wait(bthread_barrier_t* barrier);
+// NOTE: bthread_barrier_init/destroy/wait (1003.1j-2000) were never
+// implemented in libbrpc and their declarations, together with the
+// bthread_barrier_t / bthread_barrierattr_t types, have been removed.
 
 // ---------------------------------------------------------------------
 // Functions for handling thread-specific data. 

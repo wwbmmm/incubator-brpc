@@ -247,15 +247,12 @@ typedef struct bthread_rwlock_t {
     unsigned* lock_word;
 } bthread_rwlock_t;
 
+// Placeholder attribute type kept only as the `attr' parameter type of
+// bthread_rwlock_init(), which currently ignores it. The
+// bthread_rwlockattr_* functions are not implemented and their
+// declarations have been removed.
 typedef struct {
 } bthread_rwlockattr_t;
-
-typedef struct {
-    unsigned int count;
-} bthread_barrier_t;
-
-typedef struct {
-} bthread_barrierattr_t;
 
 #if defined(__cplusplus)
 class bthread_once_t;

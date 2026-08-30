@@ -67,6 +67,26 @@ TEST(RWLockTest, sanity) {
     ASSERT_EQ(0, bthread_rwlock_destroy(&rw));
 }
 
+// `attr' is documented to be ignored by bthread_rwlock_init(); passing a
+// bthread_rwlockattr_t object must behave exactly the same as passing
+// nullptr. This also pins bthread_rwlockattr_t as the (kept) `attr' type of
+// bthread_rwlock_init() after the never-implemented bthread_rwlockattr_*
+// functions were dropped from the headers.
+TEST(RWLockTest, init_ignores_attr) {
+    bthread_rwlockattr_t attr;
+    bthread_rwlock_t rw;
+    ASSERT_EQ(0, bthread_rwlock_init(&rw, &attr));
+    ASSERT_EQ(0, bthread_rwlock_rdlock(&rw));
+    ASSERT_EQ(0, bthread_rwlock_tryrdlock(&rw));
+    ASSERT_EQ(0, bthread_rwlock_unlock(&rw));
+    ASSERT_EQ(0, bthread_rwlock_unlock(&rw));
+    ASSERT_EQ(0, bthread_rwlock_wrlock(&rw));
+    // The write lock is exclusive: acquiring it again must fail with EBUSY.
+    ASSERT_EQ(EBUSY, bthread_rwlock_trywrlock(&rw));
+    ASSERT_EQ(0, bthread_rwlock_unlock(&rw));
+    ASSERT_EQ(0, bthread_rwlock_destroy(&rw));
+}
+
 TEST(RWLockTest, used_in_pthread) {
     bthread_rwlock_t rw;
     ASSERT_EQ(0, bthread_rwlock_init(&rw, nullptr));
