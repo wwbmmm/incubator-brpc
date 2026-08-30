@@ -1479,6 +1479,22 @@ void RdmaEndpoint::PollCq(Socket* m) {
     auto* rdma_transport = static_cast<RdmaTransport*>(s->_transport.get());
     CHECK(ep == rdma_transport->_rdma_ep);
 
+    // The main socket may have failed and been revived (e.g. by the health
+    // checker) after this callback was queued on the CQ socket, in which
+    // case the `Socket::Address' above succeeds again while the endpoint
+    // has already reset its old RDMA resources and may even be running a
+    // new handshake generation with a new CQ. A CQ socket that does not
+    // match the endpoint's current `_cq_sid' belongs to an older CQ
+    // generation and its callback must be discarded, otherwise it would
+    // operate on the new generation's RDMA resources (or on a null
+    // `_resource') in `PollCq' below and crash.
+    if (BAIDU_UNLIKELY(m->id() != ep->_cq_sid)) {
+        LOG_IF(WARNING, FLAGS_rdma_trace_verbose)
+                << "Discard stale cq callback on SocketId=" << m->id()
+                << " of " << s->description();
+        return;
+    }
+
     bool send = false;
     ibv_cq* cq = ep->_resource->recv_cq;
 
