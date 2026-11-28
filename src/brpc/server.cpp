@@ -768,12 +768,20 @@ int Server::ValidateEnabledProtocols(const ServerOptions& options) const {
     }
     std::vector<std::string> features;
     std::vector<std::string> fixes;
+    bool can_serve_http = true;
     if (_builtin_service_count > 0) {
         // Builtin services added by a previous Start() stay registered, so the
         // configuration cannot get rid of them anymore.
         features.push_back("builtin services are already registered");
-        fixes.push_back("create a new Server with "
-                        "ServerOptions.has_builtin_services=false");
+        if (options.has_builtin_services) {
+            fixes.push_back("create a new Server without builtin services");
+        } else {
+            // Restarting must keep has_builtin_services consistent with the
+            // registered builtin services, so http/h2 cannot be dropped.
+            can_serve_http = false;
+            fixes.push_back("create a new Server with "
+                            "ServerOptions.has_builtin_services=false");
+        }
     } else if (options.has_builtin_services) {
         features.push_back("ServerOptions.has_builtin_services is true");
         fixes.push_back("set ServerOptions.has_builtin_services=false");
@@ -789,11 +797,15 @@ int Server::ValidateEnabledProtocols(const ServerOptions& options) const {
     if (features.empty()) {
         return 0;
     }
-    LOG(ERROR) << "ServerOptions.enabled_protocols=`"
-               << options.enabled_protocols << "' enables neither http nor "
-               << "h2, but " << JoinWithAnd(features)
-               << ". They are served through http/h2, add `http' (or `h2') to "
-               << "enabled_protocols, or " << JoinWithAnd(fixes) << '.';
+    std::ostringstream err;
+    err << "ServerOptions.enabled_protocols=`" << options.enabled_protocols
+        << "' enables neither http nor h2, but " << JoinWithAnd(features)
+        << ". They are served through http/h2, ";
+    if (can_serve_http) {
+        err << "add `http' (or `h2') to enabled_protocols, or ";
+    }
+    err << JoinWithAnd(fixes) << '.';
+    LOG(ERROR) << err.str();
     errno = EINVAL;
     return -1;
 }
@@ -847,7 +859,8 @@ int Server::InitializeOnce() {
     return 0;
 }
 
-int Server::InitALPNOptions(const ServerSSLOptions* options) {
+int Server::InitALPNOptions(const ServerSSLOptions* options,
+                            const std::string& enabled_protocols) {
     if (options == nullptr) {
         LOG(ERROR) << "Fail to init alpn options, ssl options is nullptr.";
         return -1;
@@ -869,11 +882,11 @@ int Server::InitALPNOptions(const ServerSSLOptions* options) {
         // Negotiating a protocol without an installed handler makes the client
         // fail on its first request, reject the configuration instead.
         std::unordered_set<std::string> whitelist;
-        ParseEnabledProtocols(_options.enabled_protocols, &whitelist);
+        ParseEnabledProtocols(enabled_protocols, &whitelist);
         if (!whitelist.empty() && whitelist.count(protocol->name) == 0) {
             LOG(ERROR) << "alpn=" << alpn << " is not in "
                        << "ServerOptions.enabled_protocols=`"
-                       << _options.enabled_protocols << '\'';
+                       << enabled_protocols << '\'';
             errno = EINVAL;
             return -1;
         }
@@ -1074,6 +1087,14 @@ int Server::StartInternal(const butil::EndPoint& endpoint,
         errno = EINVAL;
         return -1;
     }
+    // Validate ALPN (and set `_raw_alpns') before the options are adopted and
+    // session data is reserved, so that a rejected configuration leaves no
+    // data created by the caller's factories behind.
+    if (real_opt.has_ssl_options() &&
+        InitALPNOptions(&real_opt.ssl_options(),
+                        real_opt.enabled_protocols) != 0) {
+        return -1;
+    }
 
     int ret = TransportFactory::ContextInitOrDie(real_opt.socket_mode, true, &real_opt);
     if (ret != 0) {
@@ -1219,11 +1240,8 @@ int Server::StartInternal(const butil::EndPoint& endpoint,
     FreeSSLContexts();
     if (_options.has_ssl_options()) {
 
-        // Change ServerSSLOptions.alpns to _raw_alpns.
+        // `_raw_alpns' was initialized with the validated ALPN options above.
         // AddCertificate function maybe access raw_alpns variable.
-        if (InitALPNOptions(_options.mutable_ssl_options()) != 0) {
-            return -1;
-        }
         CertInfo& default_cert = _options.mutable_ssl_options()->default_cert;
         if (default_cert.certificate.empty()) {
             LOG(ERROR) << "default_cert is empty";
@@ -1617,6 +1635,28 @@ int Server::AddServiceInternal(google::protobuf::Service* service,
         return -1;
     }
 
+    // Services added while Start() is running (e.g. from bthread_init_fn) are
+    // not seen by the validation of the user-provided options, so reject their
+    // restful mappings here if they cannot be served. Do it before touching
+    // the tables so that a rejection changes no state and no ownership.
+    if (_in_start) {
+        butil::StringPiece restful_mappings = svc_opt.restful_mappings;
+        restful_mappings.trim_spaces();
+        if (!restful_mappings.empty()) {
+            std::unordered_set<std::string> whitelist;
+            ParseEnabledProtocols(_options.enabled_protocols, &whitelist);
+            if (!whitelist.empty() && whitelist.count("http") == 0 &&
+                whitelist.count("h2") == 0) {
+                LOG(ERROR) << "Fail to add restful service=`" << sd->full_name()
+                           << "': ServerOptions.enabled_protocols=`"
+                           << _options.enabled_protocols
+                           << "' enables neither http nor h2";
+                errno = EINVAL;
+                return -1;
+            }
+        }
+    }
+
     if (_fullname_service_map.seek(sd->full_name()) != nullptr) {
         LOG(ERROR) << "service=" << sd->full_name() << " already exists";
         return -1;
@@ -1703,24 +1743,6 @@ int Server::AddServiceInternal(google::protobuf::Service* service,
     butil::StringPiece restful_mappings = svc_opt.restful_mappings;
     restful_mappings.trim_spaces();
     if (!restful_mappings.empty()) {
-        // Services added while Start() is running (e.g. from bthread_init_fn)
-        // were not seen by the validation of the user-provided options, so
-        // check that their restful mappings can be served as well.
-        if (_in_start) {
-            std::unordered_set<std::string> whitelist;
-            ParseEnabledProtocols(_options.enabled_protocols, &whitelist);
-            if (!whitelist.empty() && whitelist.count("http") == 0 &&
-                whitelist.count("h2") == 0) {
-                LOG(ERROR) << "Fail to add restful service=`" << sd->full_name()
-                           << "': ServerOptions.enabled_protocols=`"
-                           << _options.enabled_protocols
-                           << "' enables neither http nor h2";
-                // The service is already registered, undo it like the
-                // RESTful mapping failures below.
-                RemoveService(service);
-                return -1;
-            }
-        }
         // Parse the mappings.
         std::vector<RestfulMapping> mappings;
         if (!ParseRestfulMappings(restful_mappings, &mappings)) {

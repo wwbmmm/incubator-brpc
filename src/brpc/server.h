@@ -73,12 +73,13 @@ struct SocketSSLContext;
 struct ServerOptions {
     ServerOptions();  // Constructed with default options.
 
-    // NOTE: pointers in this struct are owned by the caller until they are
-    // adopted by a Server. A Server::Start() rejected by the validation of
-    // this struct (e.g. an invalid enabled_protocols) adopts nothing, so the
-    // caller still owns and must free them. Once Start() gets past that
-    // validation, the Server owns them and frees them in its destructor even
-    // if Start() fails later, e.g. when the port cannot be bound.
+    // NOTE: an early rejection of Server::Start() (e.g. an invalid
+    // enabled_protocols) happens before the options are adopted, so it keeps
+    // the existing ownership of every field: the caller still owns what it
+    // owned before the call, and the Server keeps whatever it took over from
+    // a previous Start(). Fields documented as owned by Server are freed by
+    // the Server destructor once the options are adopted, even if Start()
+    // fails later, e.g. when the port cannot be bound.
 
     // connections without data transmission for so many seconds will be closed
     // Default: -1 (disabled)
@@ -722,7 +723,8 @@ friend struct RevertServerStatus;
     // ensured to be called only once
     int InitializeOnce();
 
-    int InitALPNOptions(const ServerSSLOptions* options);
+    int InitALPNOptions(const ServerSSLOptions* options,
+                        const std::string& enabled_protocols);
 
     // Fails if ServerOptions.enabled_protocols has unknown names, or excludes
     // both http and h2 while features served through http/h2 (builtin

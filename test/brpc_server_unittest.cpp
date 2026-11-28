@@ -822,7 +822,40 @@ TEST_F(ServerTest, registered_builtin_services_hint_to_use_new_server) {
     LogSinkScope log_scope;
     ASSERT_EQ(-1, server.Start(ep, &opt));
     ASSERT_NE(std::string::npos, log_scope.sink().find("already registered"));
+    // Adding http cannot work either, so it must not be suggested.
+    ASSERT_EQ(std::string::npos, log_scope.sink().find("add `http'"));
     ASSERT_EQ(EINVAL, errno);
+}
+
+class CountingDataFactory : public brpc::DataFactory {
+public:
+    void* CreateData() const override {
+        ++created;
+        return new int(0);
+    }
+    void DestroyData(void* data) const override {
+        ++destroyed;
+        delete static_cast<int*>(data);
+    }
+    mutable int created = 0;
+    mutable int destroyed = 0;
+};
+
+// A rejected ALPN configuration must not create session-local data through the
+// caller's factory, otherwise the factory may be destroyed while the Server
+// still holds data created by it.
+TEST_F(ServerTest, rejected_alpn_creates_no_session_data) {
+    CountingDataFactory factory;
+    brpc::Server server;
+    brpc::ServerOptions opt;
+    opt.has_builtin_services = false;
+    opt.enabled_protocols = "h2";
+    opt.mutable_ssl_options()->alpns = "http,h2";
+    opt.session_local_data_factory = &factory;
+    opt.reserved_session_local_data = 4;
+    ASSERT_EQ(-1, server.Start("127.0.0.1:0", &opt));
+    ASSERT_EQ(EINVAL, errno);
+    ASSERT_EQ(0, factory.created);
 }
 
 // ALPN must not negotiate a protocol whose handler is not installed.
